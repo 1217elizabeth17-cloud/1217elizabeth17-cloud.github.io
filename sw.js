@@ -1,5 +1,5 @@
 // Synesthetic PWA service worker — offline app shell
-const CACHE = 'synesthetic-v17';
+const CACHE = 'synesthetic-v20';
 const ASSETS = [
   './',
   './index.html',
