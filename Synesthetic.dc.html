@@ -150,6 +150,10 @@
   @keyframes syn-breathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
   @keyframes syn-spin { to { transform: rotate(360deg); } }
   @keyframes syn-float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+  /* flashcard deal-away motion: correct card slides back/up off the deck, next card rises in */
+  @keyframes syn-fc-good { 0% { transform: translateY(0) scale(1) rotate(0); opacity:1; } 100% { transform: translateY(-46px) scale(0.86) rotate(-3deg); opacity:0; } }
+  @keyframes syn-fc-bad { 0% { transform: translateX(0) rotate(0); opacity:1; } 100% { transform: translateX(52px) rotate(3deg); opacity:0; } }
+  @keyframes syn-fc-in { from { opacity:0; transform: translateY(26px) scale(0.97); } to { opacity:1; transform: translateY(0) scale(1); } }
   main { overscroll-behavior-y: contain; }
   @media (max-width: 760px) {
     .syn-collapse { grid-template-columns: 1fr !important; }
@@ -2247,7 +2251,8 @@ class Component extends DCLogic {
     quizGood: 0,
     quizDone: false,
     quizWrong: [],
-    // write / typing mode
+    fcExit: null,
+    fcEnter: false,
     writeQueue: [],
     writeTotal: 0,
     writeInput: "",
@@ -2644,6 +2649,16 @@ class Component extends DCLogic {
     const to = (n) => mix(n).toString(16).padStart(2, "0");
     return "#" + to(r) + to(g) + to(b);
   }
+  // Take the neon edge off very bright/saturated hues (worst offenders: pure yellow/green)
+  // without touching calmer mid-tones. Used only for the light-theme tile skin.
+  _muteBright(hex) {
+    const { h, s, v } = this.hexToHsv(hex);
+    const L = this.lum(hex);
+    if (L < 0.62 && s < 0.8) return hex;              // already calm — leave it
+    const over = Math.max(L - 0.62, s - 0.8, 0);      // how "loud" it is
+    const k = Math.min(over * 1.4, 0.34);             // cap the pull-down
+    return this.hsvToHex(h, this._clamp01(s * (1 - k)), this._clamp01(v * (1 - k * 0.45)));
+  }
   _cardSkin(hex, a1, a2) {
     const t = this.state.theme;
     const dark = t === "charcoal" || t === "black";
@@ -2666,11 +2681,13 @@ class Component extends DCLogic {
     const near = Math.max(0, L - 0.66);              // how light-on-light the card is
     const edge = 0.11 + near * 0.9;                  // darker hairline for pale cards
     const veil = near * 0.14;                        // faint darkening so a pale fill lifts off cream
-    const colorGlow = `, 0 6px 15px -5px ${this.rgba(gc, 0.5)}, 0 14px 28px -12px ${this.rgba(gc, 0.34)}`;
+    const mh = this._muteBright(hex);                 // tone down loud hues for the fill + smear
+    const mgc = this._glowColor(mh, this.lum(mh));
+    const colorGlow = `, 0 6px 15px -5px ${this.rgba(mgc, 0.5)}, 0 14px 28px -12px ${this.rgba(mgc, 0.34)}`;
     return {
       backgroundColor: "var(--surface-solid)",
-      backgroundImage: `linear-gradient(155deg, ${this.rgba(hex, a1)}, ${this.rgba(hex, a2)}), linear-gradient(0deg, rgba(74,62,48,${veil.toFixed(3)}), rgba(74,62,48,${veil.toFixed(3)}))`,
-      border: `1px solid color-mix(in srgb, ${hex} 42%, rgba(74,62,48,${edge.toFixed(3)}))`,
+      backgroundImage: `linear-gradient(155deg, ${this.rgba(mh, a1)}, ${this.rgba(mh, a2)}), linear-gradient(0deg, rgba(74,62,48,${veil.toFixed(3)}), rgba(74,62,48,${veil.toFixed(3)}))`,
+      border: `1px solid color-mix(in srgb, ${mh} 42%, rgba(74,62,48,${edge.toFixed(3)}))`,
       boxShadow: `0 1px 2px rgba(40,36,30,0.08)${colorGlow}`,
     };
   }
@@ -3075,18 +3092,42 @@ class Component extends DCLogic {
     }
     return prev[n];
   }
-  _wClose(a, b) { if (a === b) return true; if (Math.abs(a.length - b.length) > 2) return false; return this._lev(a, b) <= 1; }
+  _wClose(a, b) {
+    if (a === b) return true;
+    const short = Math.min(a.length, b.length);
+    // scale allowed edits by word length: 1 for short words, 2 for longer ones
+    const tol = short <= 4 ? 1 : (short <= 7 ? 2 : 3);
+    if (Math.abs(a.length - b.length) > tol) return false;
+    return this._lev(a, b) <= tol;
+  }
+  // whole-string near-match: true when the answer is the target with only minor typos
+  _wNearWhole(na, nt) {
+    if (na === nt) return true;
+    const L = Math.max(na.length, nt.length);
+    if (!L) return false;
+    const d = this._lev(na, nt);
+    // allow ~15% edits, min 1 — covers single/double letter typos & small word swaps
+    return d <= Math.max(1, Math.round(L * 0.15));
+  }
   writeSimilar(answer, target) {
     const na = this._wNorm(answer), nt = this._wNorm(target);
     if (!na) return false;
     if (na === nt) return true;
+    // minor spelling error anywhere in the whole answer → count it right
+    if (this._wNearWhole(na, nt)) return true;
     const lenient = this.state.settings.acceptSimilar !== false;
-    if (!lenient) return na === nt; // toggle off → exact wording required
     const t = this._wKeywords(target), a = this._wKeywords(answer);
-    if (!t.length) return this._lev(na, nt) <= Math.max(2, Math.round(nt.length * 0.2));
+    if (!lenient) {
+      // even in strict mode, forgive tiny typos, but require the same wording
+      return this._wNearWhole(na, nt) || (t.length > 0 && t.every(w => a.some(x => this._wClose(x, w))));
+    }
+    if (!t.length) return this._lev(na, nt) <= Math.max(2, Math.round(nt.length * 0.25));
     let hit = 0;
     for (const w of t) { if (a.some(x => this._wClose(x, w))) hit++; }
-    return (hit / t.length) >= 0.45; // similar / same underlying meaning counts
+    // if it means the same thing generally, count it — one third of the key ideas is enough,
+    // or any single key word when the target is very short (1–2 keywords)
+    if (t.length <= 2 && hit >= 1) return true;
+    return (hit / t.length) >= 0.34;
   }
   toggleAcceptSimilar = () => this.setState(s => ({ settings: { ...s.settings, acceptSimilar: !(s.settings.acceptSimilar !== false) } }));
   toggleQuizNoColor = () => this.setState(s => ({ settings: { ...s.settings, quizNoColor: !s.settings.quizNoColor } }));
@@ -3095,8 +3136,8 @@ class Component extends DCLogic {
     const t = this.state.theme;
     if (t === "black")    return "#1b1b1a";
     if (t === "charcoal") return "#33302b";
-    if (t === "cream")    return "#efe6d2";
-    return "#eef0f2"; // white / light
+    if (t === "cream")    return "#d8c9a6"; // warm tan, darker than cream bg
+    return "#d9d3c5"; // white/light: soft greige, distinct from the paper bg
   }
   markWriteCorrect = () => {
     const cur = this.state.writeQueue[0]; if (!cur) return;
@@ -3156,7 +3197,20 @@ class Component extends DCLogic {
     const quizWrong = good ? s.quizWrong : [...s.quizWrong, cur];
     return { cards, quizGood: s.quizGood + (good ? 1 : 0), quizWrong, quizIdx: nextIdx, quizRevealed: false, quizDone: done };
   });
-  quizExit = () => this.setState({ quizMode: null, quizDone: false, quizScope: "all", quizDecks: [], quizWrong: [] });
+  quizExit = () => this.setState({ quizMode: null, quizDone: false, quizScope: "all", quizDecks: [], quizWrong: [], fcExit: null });
+  // Flashcard deal-away: play the exit motion, then advance to the next card.
+  fcGrade = (good) => () => {
+    if (this.state.fcExit) return; // already animating
+    if (this.state.settings.reduceMotion) { this.quizGrade(good)(); return; }
+    this.setState({ fcExit: good ? "good" : "bad" });
+    clearTimeout(this._fcTimer);
+    this._fcTimer = setTimeout(() => {
+      this.quizGrade(good)();
+      this.setState({ fcExit: null, fcEnter: true });
+      clearTimeout(this._fcInTimer);
+      this._fcInTimer = setTimeout(() => this.setState({ fcEnter: false }), 320);
+    }, 300);
+  };
   // Re-quiz ONLY the cards missed this round; loop shrinks each pass until all are right.
   retryMissed = () => this.setState(s => {
     if (!s.quizWrong.length) return {};
@@ -4630,13 +4684,17 @@ class Component extends DCLogic {
       const hex = noColor ? this._neutralFace() : c.color.hex; const on = this.textOn(hex);
       const scopeLabel = s.quizScope === "decks" && (s.quizDecks || []).length ? s.quizDecks[0]
         : s.quizScope === "marked" ? "Marked cards" : s.quizScope === "pinned" ? "Pinned decks" : "All cards";
+      const fcAnim = s.fcExit === "good" ? "syn-fc-good .3s cubic-bezier(.5,0,.75,0) forwards"
+        : s.fcExit === "bad" ? "syn-fc-bad .3s cubic-bezier(.5,0,.75,0) forwards"
+        : s.fcEnter ? "syn-fc-in .32s cubic-bezier(.16,1,.3,1)" : "none";
       return { ...base, isFlashcard: true, isRecall: false, isCompare: false, isSingle: false,
         shuffle: this.quizShuffle, flip: this.quizFlip, scopeLabel,
+        gradeGood: this.fcGrade(true), gradeBad: this.fcGrade(false),
         faceLabel: s.quizRevealed ? "Definition" : "Concept",
         fcConcept: c.concept, fcSubject: c.subject, fcColorName: c.color.name,
         fcDefinition: c.definition, fcExample: c.example, fcHasExample: !!c.example,
         fcPhrase: c.phrase, fcHasPhrase: !!c.phrase,
-        fcFrontStyle: { borderRadius:"24px", padding:"52px 40px", minHeight:"300px", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", textAlign:"center", cursor:"pointer", background:`linear-gradient(150deg, ${hex}, ${this.rgba(hex,0.68)})`, color:on, border:`1px solid ${this.rgba(hex,0.4)}`, boxShadow:`0 16px 42px ${this.rgba(hex,0.35)}` },
+        fcFrontStyle: { borderRadius:"24px", padding:"52px 40px", minHeight:"300px", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", textAlign:"center", cursor:"pointer", background:`linear-gradient(150deg, ${hex}, ${this.rgba(hex,0.68)})`, color:on, border:`1px solid ${this.rgba(hex,0.4)}`, boxShadow:`0 16px 42px ${this.rgba(hex,0.35)}`, animation: fcAnim, willChange:"transform,opacity" },
         fcSubStyle: { fontFamily:"'Space Mono',monospace", fontSize:"11px", letterSpacing:"0.12em", textTransform:"uppercase", color: on==="#f7f5f0"?"rgba(247,245,240,0.75)":"rgba(44,42,39,0.6)" },
         fcHintColor: on==="#f7f5f0"?"rgba(247,245,240,0.7)":"rgba(44,42,39,0.55)",
         fcSwatchStyle: { width:"16px", height:"16px", borderRadius:"50%", flex:"0 0 auto", background:hex, boxShadow:`0 1px 5px ${this.rgba(hex,0.5)}` },
